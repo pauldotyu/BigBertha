@@ -27,10 +27,12 @@ spec:
           value: password
         - name: auth.replicationPassword
           value: password
+        - name: auth.database
+          value: mlflow
     chart: postgresql
   destination:
     server: 'https://kubernetes.default.svc'
-    namespace: postgresql
+    namespace: postgres
   syncPolicy:
     syncOptions:
       - CreateNamespace=true
