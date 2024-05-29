@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: 'https://github.com/aishwaryaprabhat/BigBertha'
+    repoURL: 'https://github.com/pauldotyu/BigBertha'
     path: llmops
     targetRevision: HEAD
     helm:
