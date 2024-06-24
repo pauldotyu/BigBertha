@@ -21,7 +21,25 @@ cd BigBertha
 
 ## Provision an AKS Cluster
 
-Start by logging into Azure and creating a resource group and an AKS cluster.
+Start by logging into Azure and ensure you have all the necessary features registered for your subscription.
+
+```bash
+az feature register --namespace Microsoft.ContainerService --name EnableAPIServerVnetIntegrationPreview
+az feature register --namespace Microsoft.ContainerService --name NRGLockdownPreview
+az feature register --namespace Microsoft.ContainerService --name SafeguardsPreview
+az feature register --namespace Microsoft.ContainerService --name NodeAutoProvisioningPreview
+az feature register --namespace Microsoft.ContainerService --name DisableSSHPreview
+az feature register --namespace Microsoft.ContainerService --name AutomaticSKUPreview
+```
+
+Ensure you have the necessary Azure CLI extensions installed.
+
+```bash
+az extension add --name aks-preview
+az extension add --name amg
+```
+
+Create a resource group and an AKS cluster.
 
 ```bash
 # Set a random resource identifier
@@ -30,7 +48,7 @@ export RAND
 echo "Random resource identifier will be: ${RAND}"
 
 # Set variables
-LOCATION=eastus
+LOCATION=westeurope
 RG_NAME=rg-bigbertha$RAND
 AKS_NAME=aks-bigbertha$RAND
 MONITOR_NAME=mon-bigbertha$RAND
