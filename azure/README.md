@@ -30,6 +30,7 @@ az feature register --namespace Microsoft.ContainerService --name SafeguardsPrev
 az feature register --namespace Microsoft.ContainerService --name NodeAutoProvisioningPreview
 az feature register --namespace Microsoft.ContainerService --name DisableSSHPreview
 az feature register --namespace Microsoft.ContainerService --name AutomaticSKUPreview
+az feature register --namespace Microsoft.ContainerService --name AIToolchainOperatorPreview
 ```
 
 Ensure you have the necessary Azure CLI extensions installed.
@@ -37,6 +38,7 @@ Ensure you have the necessary Azure CLI extensions installed.
 ```bash
 az extension add --name aks-preview
 az extension add --name amg
+az extension add --name alertsmanagement
 ```
 
 Create a resource group and an AKS cluster.
@@ -68,10 +70,133 @@ az aks create -n $AKS_NAME -g $RG_NAME \
   --sku automatic \
   --azure-monitor-workspace-resource-id $MONITOR_ID \
   --workspace-resource-id $LOGS_ID \
-  --grafana-resource-id $GRAFANA_ID
+  --grafana-resource-id $GRAFANA_ID \
+  --enable-ai-toolchain-operator
 
 # Connect to the AKS cluster
 az aks get-credentials -n $AKS_NAME -g $RG_NAME
+```
+
+Configure Kaito addon for the AKS cluster.
+
+```bash
+# Set variables to configure Kaito
+MC_RESOURCE_GROUP=$(az aks show -n $AKS_NAME -g $RG_NAME --query nodeResourceGroup -o tsv)
+PRINCIPAL_ID=$(az identity show --n "ai-toolchain-operator-${AKS_NAME}" -g $MC_RESOURCE_GROUP --query principalId -o tsv)
+KAITO_IDENTITY_NAME="ai-toolchain-operator-${AKS_NAME}"
+AKS_OIDC_ISSUER=$(az aks show -n $AKS_NAME -g $RG_NAME --query oidcIssuerProfile.issuerUrl -o tsv)
+AKS_ID=$(az aks show -n $AKS_NAME -g $RG_NAME --query id -o tsv)
+
+# Grant permissions to the AI Toolchain Operator
+az role assignment create \
+  --role Contributor \
+  --assignee-object-id $PRINCIPAL_ID \
+  --assignee-principal-type ServicePrincipal \
+  --scope $AKS_ID
+
+# Disable AKS Automatic to remove NRG Lockdown
+az aks update -n $AKS_NAME -g $RG_NAME --sku base
+
+# Remove the NRG Lockdown to update Kaito managed identity
+az aks update -n $AKS_NAME -g $RG_NAME --nrg-lockdown-restriction-level Unrestricted --no-wait
+
+# Create Kaito federated credential
+az identity federated-credential create \
+  -n kaito-federated-identity \
+  -g $MC_RESOURCE_GROUP \
+  --identity-name $KAITO_IDENTITY_NAME \
+  --issuer $AKS_OIDC_ISSUER \
+  --subject system:serviceaccount:kube-system:kaito-gpu-provisioner \
+  --audience api://AzureADTokenExchange
+```
+
+Create Azure Event Hub and Action Group which will be used to trigger Argo Events and the Argo Workflow for model retraining.
+
+```bash
+# Set eventhub name
+EH_NAMESPACE=eh-bigbertha$RAND
+EH_NAME=myeventhub
+AG_NAME=ag-bigbertha$RAND
+
+# Create Azure Event Hub and get the FQDN
+EH_FQDN=$(az eventhubs namespace create \
+  -g $RG_NAME \
+  -n $EH_NAMESPACE \
+  -l $LOCATION \
+  --sku Basic \
+  --query serviceBusEndpoint \
+  -o tsv | sed -e 's/https:\/\///' -e 's/:443\///')
+
+# Get the access key name and key
+EH_KEY_NAME=$(az eventhubs namespace authorization-rule keys list \
+  -g $RG_NAME \
+  --namespace-name $EH_NAMESPACE \
+  --name RootManageSharedAccessKey \
+  --query keyName \
+  -o tsv)
+
+EH_KEY=$(az eventhubs namespace authorization-rule keys list \
+  -g $RG_NAME \
+  --namespace-name $EH_NAMESPACE \
+  --name RootManageSharedAccessKey \
+  --query primaryKey \
+  -o tsv)
+
+# Create Azure Event Hub eventhub
+az eventhubs eventhub create \
+  -g $RG_NAME \
+  -n $EH_NAME \
+  --namespace-name $EH_NAMESPACE \
+  --cleanup-policy Delete \
+  --partition-count 1
+
+# Create Azure Monitor Action Group
+AG_ID=$(az monitor action-group create \
+  --action eventhub myaction $(az account show --query id -o tsv) $EH_NAMESPACE $EH_NAME usecommonalertschema \
+  -n $AG_NAME \
+  -g $RG_NAME \
+  --query id \
+  -o tsv)
+```
+
+Create Prometheus Rule Group Alert and configure it to send alerts to the Azure Event Hub via the Action Group.
+
+```bash
+# Create a rule json file
+cat << EOF > llmops_rule.json
+[
+  {
+    "alert": "thumbs_down_count_exceeded",
+    "enabled": true,
+    "expression": "thumbs_down_count > thumbs_up_count",
+    "severity": 3,
+    "for": "PT1M",
+    "labels": {},
+    "annotations": {},
+    "actions": [
+      {
+        "actionGroupId": "${AG_ID}",
+        "actionProperties": {}
+      }
+    ],
+    "resolveConfiguration": {
+      "autoResolved": true,
+      "timeToResolve": "PT2M"
+    }
+  }
+]
+EOF
+
+# Create Prometheus Rule Group and pass in the rule json file
+az alerts-management prometheus-rule-group create \
+  -n llmops \
+  -g $RG_NAME \
+  -l $LOCATION \
+  --enabled \
+  --description "Model retraining required" \
+  --interval PT15S \
+  --scopes $MONITOR_ID \
+  --rules llmops_rule.json
 ```
 
 ## Edit Karpenter nodepool
@@ -116,7 +241,6 @@ kubectl config set-context --current --namespace=argocd
 Deploy the underlying components.
 
 ```bash
-argocd app create kube-prometheus-stack --sync-policy auto -f infra/prometheus.yaml
 argocd app create argo-events --sync-policy auto -f infra/argoevents.yaml
 argocd app create argowf --sync-policy auto -f infra/argowf.yaml
 argocd app create postgres --sync-policy auto -f infra/postgres.yaml
@@ -151,30 +275,123 @@ EXTERNAL_IP=$(kubectl get -n milvus svc/milvus-minio -o jsonpath='{.status.loadB
 echo http://$EXTERNAL_IP:9001
 ```
 
-Click the link in the termainal to open the MinIO dashboard. Use the username and password from the previous step to login.
-
-Under **User**, click on the **Access Keys** tab and create a new access key and note both the access key and secret key.
+Click the link in the terminal to open the MinIO dashboard. Use the username and password from the previous step to login.
 
 Under **Administrator**, click on the **Buckets** tab and create a new bucket named `ingestion`.
 
+Under **User**, click on the **Access Keys** tab and create a new access key and save both the access key and secret key to variables.
+
+```bash
+MINIO_ACCESS_KEY=<access_key>
+MINIO_SECRET_KEY=<secret_key>
+```
+
 ## Deploy vector-ingestion and chatbot apps
 
-Open the `infra/bigbertha-vector-ingestion.yaml` file and update the values for `minio.accessKey.value` and `minio.secretKey.value` with the access key and secret key respectively.
+Create the bigbertha-chatbot app manifest file.
+
+```bash
+cat << EOF > vectoringestion-app.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: bigbertha-vector-ingestion
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/pauldotyu/BigBertha'
+    path: vector-ingestion
+    targetRevision: HEAD
+    helm:
+      valueFiles:
+        - values.yaml
+      parameters:
+        - name: minio.accessKey.value
+          value: $MINIO_ACCESS_KEY
+        - name: minio.secretKey.value
+          value: $MINIO_SECRET_KEY
+        - name: minio.endpoint
+          value: milvus-minio.milvus.svc
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: vector-ingestion
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+EOF
+```
 
 Then run the following command to deploy the vector-ingestion app.
 
 ```bash
-argocd app create bigbertha-vector-ingestion --sync-policy auto -f infra/bigbertha-vector-ingestion.yaml
+argocd app create bigbertha-vector-ingestion --sync-policy auto -f vectoringestion-app.yaml
 ```
 
-Next head over to [HuggingFace](https://huggingface.co/settings/tokens), login to your account, then get your access token
+Next head over to [HuggingFace](https://huggingface.co/settings/tokens), login to your account, then get your access token and save it to a variable.
 
-Open the `infra/bigbertha-chatbot.yaml` file and update the value for `environment.HUGGINGFACEHUB_API_TOKEN` with your access token
+```bash
+HF_API_TOKEN=<your_access_token>
+```
+
+Create the bigbertha-chatbot app manifest file.
+  
+```bash
+cat << EOF > chatbot-app.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: bigbertha-llmchatbot
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/pauldotyu/BigBertha'
+    path: llmops
+    targetRevision: HEAD
+    helm:
+      valueFiles:
+        - values.yaml
+      parameters:
+        - name: chatbotapp.environment.HUGGINGFACEHUB_API_TOKEN
+          value: $HF_API_TOKEN
+        - name: chatbotapp.image.tag
+          value: v1.7
+        - name: chatbotapp.replicas
+          value: '1'
+        - name: chatbotapp.resources.memoryLimit
+          value: 5Gi
+        - name: chatbotapp.resources.memoryRequest
+          value: 3Gi
+        - name: chatbotapp.image.repository
+          value: aishwaryaprabhat/chatbot
+        - name: servicemonitor.useAzureServiceMonitor
+          value: "true"
+        - name: eventsource.azureEventHub.fqdn
+          value: $EH_FQDN
+        - name: eventsource.azureEventHub.hubName
+          value: $EH_NAME
+        - name: eventsource.azureEventHub.sharedAccessKeyName
+          value: $EH_KEY_NAME
+        - name: eventsource.azureEventHub.sharedAccessKey
+          value: $EH_KEY
+        - name: alertmanagerconfig.useAzureAlerts
+          value: "true"
+        - name: prometheusrule.useAzurePrometheusRules
+          value: "true"
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: bigbertha
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+EOF
+```
 
 Then run the following command to deploy the chatbot app.
 
 ```bash
-argocd app create bigbertha-llmchatbot --sync-policy auto -f infra/bigbertha-chatbot.yaml
+argocd app create bigbertha-llmchatbot --sync-policy auto -f chatbot-app.yaml
 ```
 
 Ensure all the components are deployed successfully and showing `Healthy` status.
@@ -205,15 +422,19 @@ Next, click the link to the metrics endpoint to view the metrics. You should see
 
 Refresh the chatbot page and click the thumbs down button a few times. This will trigger a Prometheus alert which will in turn trigger a retraining workflow.
 
-If you port-foward the Prometheus service, you can view the alerts in the Prometheus UI.
+## Verify the chatbot metrics endpoint is being scraped by Azure Managed Prometheus
 
+Run the following command to port-forward the AMA metrics pod to view the metrics.
 ```bash
-kubectl port-forward svc/prometheus-operated -n prometheus 9090:9090
+AMA_METRICS_POD_NAME=$(kubectl get po -n kube-system -lrsName=ama-metrics -o jsonpath='{.items[0].metadata.name}')
+kubectl port-forward $AMA_METRICS_POD_NAME -n kube-system 9090
 ```
 
-Open the Prometheus UI at http://localhost:9090 and click on the **Alerts** tab to view the alerts. You should see an alert for `thumbs_down_count_exceeded`.
+Open the Prometheus UI at http://localhost:9090 and click on the **Status** tab to view the targets. You should see the `serviceMonitor/bigbertha/bigbertha-llmchatbot-servicemonitor` target in **UP** state.
 
-When the alert is in **Firing** state, this will trigger the retraining workflow which can be viewed via the Argo CLI.
+The metrics endpoint should be scraped every 15 seconds and you should see the metrics for `thumbs_down_count` and `thumbs_up_count` when using the Prometheus Explorer within the Azure Monitor Workspace in the Azure Portal.
+
+You should also see an alert in the Alerts blade in the AKS portal. This alert will trigger an Azure Event Hub alert which will trigger Argo Events and the Argo Workflow for model retraining.
 
 ```bash
 argo watch @latest -n bigbertha

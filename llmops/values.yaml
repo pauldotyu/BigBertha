@@ -20,12 +20,18 @@ servicemonitor:
   targetNamespace: bigbertha
   selectorLabels:
     app: llmchatbot
+  useAzureServiceMonitor: false
 
 eventbus:
   namespace: bigbertha
 
 eventsource:
   name: retraining-webhook
+  azureEventHub:
+    fqdn: "placeholder.servicebus.windows.net"
+    hubName: "llmops"
+    sharedAccessKeyName: "placeholder"
+    sharedAccessKey: "placeholder"
   service:
     name: retraining-webhook
     ports:
@@ -36,7 +42,6 @@ eventsource:
     port: "12000"
     endpoint: /retraining
     method: POST
-
 
 sensor:
   name: retraining-sensor
@@ -53,6 +58,7 @@ alertmanagerconfig:
   receiverName: webhook-receiver
   receiverURL: http://retraining-webhook-eventsource-svc.bigbertha.svc:12000/retraining
   routeMatchAlertname: thumbs_down_count_exceeded
+  useAzureAlerts: false
 
 prometheusrule:
   name: thumbs-down-count-rule
@@ -61,6 +67,7 @@ prometheusrule:
   alertFor: 60s
   alertSummary: Model retraining required
   alertDescription: Model retraining required
+  useAzurePrometheusRules: false
 
 
 

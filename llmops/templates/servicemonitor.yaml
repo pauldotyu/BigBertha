@@ -1,5 +1,5 @@
 # templates/service-monitor.yaml
-apiVersion: monitoring.coreos.com/v1
+apiVersion: {{ ternary "azmonitoring.coreos.com/v1" "monitoring.coreos.com/v1" .Values.servicemonitor.useAzureServiceMonitor }}
 kind: ServiceMonitor
 metadata:
   labels:

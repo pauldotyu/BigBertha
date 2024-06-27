@@ -1,8 +1,31 @@
+{{- if .Values.eventsource.azureEventHub }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: azure-eventhub-secret
+type: Opaque
+data:
+  sharedAccessKeyName: {{ .Values.eventsource.azureEventHub.sharedAccessKeyName | b64enc }}
+  sharedAccessKey: {{ .Values.eventsource.azureEventHub.sharedAccessKey | b64enc }}
+---
+{{- end }}
 apiVersion: argoproj.io/v1alpha1
 kind: EventSource
 metadata:
   name: {{ .Values.eventsource.name }}
 spec:
+  {{- if .Values.eventsource.azureEventHub }}
+  azureEventsHub:
+    {{ .Values.eventsource.webhook.triggerName }}:
+      fqdn: {{ .Values.eventsource.azureEventHub.fqdn }}
+      sharedAccessKeyName:
+        name:  azure-eventhub-secret
+        key: sharedAccessKeyName
+      sharedAccessKey:
+        name:  azure-eventhub-secret
+        key: sharedAccessKey
+      hubName: {{ .Values.eventsource.azureEventHub.hubName }}
+  {{- else }}
   service:
     name: {{ .Values.eventsource.service.name }}
     ports: {{ toYaml .Values.eventsource.service.ports | nindent 6 }}
@@ -11,4 +34,5 @@ spec:
         port:  "12000" # weird it can't pick up from values.yaml
         endpoint: {{ .Values.eventsource.webhook.endpoint }}
         method: {{ .Values.eventsource.webhook.method }}
+  {{- end }}
 

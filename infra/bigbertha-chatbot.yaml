@@ -13,17 +13,17 @@ spec:
       valueFiles:
         - values.yaml
       parameters:
-        - name: environment.HUGGINGFACEHUB_API_TOKEN
+        - name: chatbotapp.environment.HUGGINGFACEHUB_API_TOKEN
           value: placeholder
-        - name: image.tag
+        - name: chatbotapp.image.tag
           value: v1.7
-        - name: replicas
+        - name: chatbotapp.replicas
           value: '1'
-        - name: resources.memoryLimit
+        - name: chatbotapp.resources.memoryLimit
           value: 5Gi
-        - name: resources.memoryRequest
+        - name: chatbotapp.resources.memoryRequest
           value: 3Gi
-        - name: image.repository
+        - name: chatbotapp.image.repository
           value: aishwaryaprabhat/chatbot
   destination:
     server: 'https://kubernetes.default.svc'

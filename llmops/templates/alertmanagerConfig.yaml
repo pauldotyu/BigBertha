@@ -1,4 +1,5 @@
 # templates/alertmanager-config.yaml
+{{- if not .Values.alertmanagerconfig.useAzureAlerts }}
 apiVersion: monitoring.coreos.com/v1alpha1
 kind: AlertmanagerConfig
 metadata:
@@ -18,3 +19,4 @@ spec:
     repeatInterval: 30s
     receiver: 'webhook'
     receiver: '{{ .Values.alertmanagerconfig.receiverName }}'
+{{- end }}
