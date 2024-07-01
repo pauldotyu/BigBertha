@@ -2,12 +2,17 @@
 
 This guide will walk you through deploying BigBertha on Azure Kubernetes Service (AKS) using ArgoCD.
 
+High-level overview of the components that will be deployed:
+
+![BigBertha on Azure](../assets/bigbertha-on-azure.png)
+
 ## Prerequisites
 
 Before you begin, ensure you have the following installed:
 
 - [Git](https://git-scm.com/downloads) to clone the repository
 - [Azure CLI](https://docs.microsoft.com/cli/azure/install-azure-cli) to provision Azure resources
+- [Terraform](https://learn.hashicorp.com/tutorials/terraform/install-cli) to provision Azure resources
 - [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/) to interact with the Kubernetes cluster
 - [ArgoCD CLI](https://argo-cd.readthedocs.io/en/stable/cli_installation/) to interact with ArgoCD
 - [Argo CLI](https://github.com/argoproj/argo-workflows/releases/) to interact with Argo workflows
@@ -21,9 +26,10 @@ cd BigBertha
 
 ## Provision an AKS Cluster
 
-Start by logging into Azure and ensure you have all the necessary features registered for your subscription.
+Start by logging into Azure CLI and ensure you have all the necessary features registered for your subscription.
 
 ```bash
+az login
 az feature register --namespace Microsoft.ContainerService --name EnableAPIServerVnetIntegrationPreview
 az feature register --namespace Microsoft.ContainerService --name NRGLockdownPreview
 az feature register --namespace Microsoft.ContainerService --name SafeguardsPreview
@@ -33,188 +39,33 @@ az feature register --namespace Microsoft.ContainerService --name AutomaticSKUPr
 az feature register --namespace Microsoft.ContainerService --name AIToolchainOperatorPreview
 ```
 
-Ensure you have the necessary Azure CLI extensions installed.
+Run the following command to create a resource group and provision an AKS cluster.
 
 ```bash
-az extension add --name aks-preview
-az extension add --name amg
-az extension add --name alertsmanagement
+cd azure/infra/terraform
+terraform init
+terraform apply
 ```
 
-Create a resource group and an AKS cluster.
+> [!NOTE]
+> When prompted, enter **yes** to create the resources. This will take a few minutes to complete.
+
+When the deployment is complete, run the following commands to set environment variables and get the AKS credentials.
 
 ```bash
-# Set a random resource identifier
-RAND=$RANDOM
-export RAND
-echo "Random resource identifier will be: ${RAND}"
+# Set environment variables from Terraform output
+RG_NAME=$(terraform output -raw rg_name)
+AKS_NAME=$(terraform output -raw aks_name)
+EH_FQDN=$(terraform output -raw eh_fqdn)
+EH_NAME=$(terraform output -raw eh_name)
+EH_KEY_NAME=$(terraform output -raw eh_default_primary_key_name)
+EH_KEY=$(terraform output -raw eh_default_primary_key)
+PSQL_FQDN=$(terraform output -raw psql_fqdn)
+PSQL_USER=$(terraform output -raw psql_admin_user)
+PSQL_PASSWORD=$(terraform output -raw psql_admin_password)
 
-# Set variables
-LOCATION=westeurope
-RG_NAME=rg-bigbertha$RAND
-AKS_NAME=aks-bigbertha$RAND
-MONITOR_NAME=mon-bigbertha$RAND
-LOGS_NAME=log-bigbertha$RAND
-GRAFANA_NAME=amg-bigbertha$RAND
-
-# Create resource group
-az group create -n $RG_NAME -l $LOCATION
-
-# Create observability resources
-MONITOR_ID=$(az monitor account create -n $MONITOR_NAME -g $RG_NAME --query id -o tsv)
-LOGS_ID=$(az monitor log-analytics workspace create -n $LOGS_NAME -g $RG_NAME --query id -o tsv)
-GRAFANA_ID=$(az grafana create -n $GRAFANA_NAME -g $RG_NAME --query id -o tsv)
-
-# Create AKS cluster
-az aks create -n $AKS_NAME -g $RG_NAME \
-  --sku automatic \
-  --azure-monitor-workspace-resource-id $MONITOR_ID \
-  --workspace-resource-id $LOGS_ID \
-  --grafana-resource-id $GRAFANA_ID \
-  --enable-ai-toolchain-operator
-
-# Connect to the AKS cluster
+# Get AKS credentials
 az aks get-credentials -n $AKS_NAME -g $RG_NAME
-```
-
-Configure Kaito addon for the AKS cluster.
-
-```bash
-# Set variables to configure Kaito
-MC_RESOURCE_GROUP=$(az aks show -n $AKS_NAME -g $RG_NAME --query nodeResourceGroup -o tsv)
-PRINCIPAL_ID=$(az identity show --n "ai-toolchain-operator-${AKS_NAME}" -g $MC_RESOURCE_GROUP --query principalId -o tsv)
-KAITO_IDENTITY_NAME="ai-toolchain-operator-${AKS_NAME}"
-AKS_OIDC_ISSUER=$(az aks show -n $AKS_NAME -g $RG_NAME --query oidcIssuerProfile.issuerUrl -o tsv)
-AKS_ID=$(az aks show -n $AKS_NAME -g $RG_NAME --query id -o tsv)
-
-# Grant permissions to the AI Toolchain Operator
-az role assignment create \
-  --role Contributor \
-  --assignee-object-id $PRINCIPAL_ID \
-  --assignee-principal-type ServicePrincipal \
-  --scope $AKS_ID
-
-# Disable AKS Automatic to remove NRG Lockdown
-az aks update -n $AKS_NAME -g $RG_NAME --sku base
-
-# Remove the NRG Lockdown to update Kaito managed identity
-az aks update -n $AKS_NAME -g $RG_NAME --nrg-lockdown-restriction-level Unrestricted --no-wait
-
-# Create Kaito federated credential
-az identity federated-credential create \
-  -n kaito-federated-identity \
-  -g $MC_RESOURCE_GROUP \
-  --identity-name $KAITO_IDENTITY_NAME \
-  --issuer $AKS_OIDC_ISSUER \
-  --subject system:serviceaccount:kube-system:kaito-gpu-provisioner \
-  --audience api://AzureADTokenExchange
-```
-
-Create Azure Event Hub and Action Group which will be used to trigger Argo Events and the Argo Workflow for model retraining.
-
-```bash
-# Set eventhub name
-EH_NAMESPACE=eh-bigbertha$RAND
-EH_NAME=myeventhub
-AG_NAME=ag-bigbertha$RAND
-
-# Create Azure Event Hub and get the FQDN
-EH_FQDN=$(az eventhubs namespace create \
-  -g $RG_NAME \
-  -n $EH_NAMESPACE \
-  -l $LOCATION \
-  --sku Basic \
-  --query serviceBusEndpoint \
-  -o tsv | sed -e 's/https:\/\///' -e 's/:443\///')
-
-# Get the access key name and key
-EH_KEY_NAME=$(az eventhubs namespace authorization-rule keys list \
-  -g $RG_NAME \
-  --namespace-name $EH_NAMESPACE \
-  --name RootManageSharedAccessKey \
-  --query keyName \
-  -o tsv)
-
-EH_KEY=$(az eventhubs namespace authorization-rule keys list \
-  -g $RG_NAME \
-  --namespace-name $EH_NAMESPACE \
-  --name RootManageSharedAccessKey \
-  --query primaryKey \
-  -o tsv)
-
-# Create Azure Event Hub eventhub
-az eventhubs eventhub create \
-  -g $RG_NAME \
-  -n $EH_NAME \
-  --namespace-name $EH_NAMESPACE \
-  --cleanup-policy Delete \
-  --partition-count 1
-
-# Create Azure Monitor Action Group
-AG_ID=$(az monitor action-group create \
-  --action eventhub myaction $(az account show --query id -o tsv) $EH_NAMESPACE $EH_NAME usecommonalertschema \
-  -n $AG_NAME \
-  -g $RG_NAME \
-  --query id \
-  -o tsv)
-```
-
-Create Prometheus Rule Group Alert and configure it to send alerts to the Azure Event Hub via the Action Group.
-
-```bash
-# Create a rule json file
-cat << EOF > llmops_rule.json
-[
-  {
-    "alert": "thumbs_down_count_exceeded",
-    "enabled": true,
-    "expression": "thumbs_down_count > thumbs_up_count",
-    "severity": 3,
-    "for": "PT1M",
-    "labels": {},
-    "annotations": {},
-    "actions": [
-      {
-        "actionGroupId": "${AG_ID}",
-        "actionProperties": {}
-      }
-    ],
-    "resolveConfiguration": {
-      "autoResolved": true,
-      "timeToResolve": "PT2M"
-    }
-  }
-]
-EOF
-
-# Create Prometheus Rule Group and pass in the rule json file
-az alerts-management prometheus-rule-group create \
-  -n llmops \
-  -g $RG_NAME \
-  -l $LOCATION \
-  --enabled \
-  --description "Model retraining required" \
-  --interval PT15S \
-  --scopes $MONITOR_ID \
-  --rules llmops_rule.json
-```
-
-## Edit Karpenter nodepool
-
-Run the command to edit the Karpenter nodepool
-
-```bash
-kubectl edit nodepool default
-```
-
-Update the `karpenter.azure.com/sku-family` key to the end of the manifest to deploy E series VMs for worker nodes
-
-```yaml
-      ...
-      - key: karpenter.azure.com/sku-family
-        operator: In
-        values:
-        - E
 ```
 
 ## Deploy components
@@ -238,14 +89,18 @@ Set the default namespace to `argocd` and deploy the components.
 kubectl config set-context --current --namespace=argocd
 ```
 
+Navigate to the root of the BigBertha repository and deploy the ArgoCD applications.
+
+```bash
+cd ../../../
+```
+
 Deploy the underlying components.
 
 ```bash
 argocd app create argo-events --sync-policy auto -f infra/argoevents.yaml
 argocd app create argowf --sync-policy auto -f infra/argowf.yaml
-argocd app create postgres --sync-policy auto -f infra/postgres.yaml
 argocd app create milvus --sync-policy auto -f infra/milvus.yaml
-argocd app create mlflow --sync-policy auto -f infra/mlflow.yaml
 ```
 
 Ensure all the components are deployed successfully and showing `Healthy` status.
@@ -256,16 +111,16 @@ argocd app list
 
 ## Configure MinIO
 
-Run the following commands to get the MinIO username and password.
-
-```bash
-kubectl get secret -n milvus milvus-minio -o jsonpath='{.data.root-user}' | base64 --decode && echo && k get secret -n milvus milvus-minio -o jsonpath='{.data.root-password}' | base64 --decode
-```
-
 Patch the MinIO service to expose it as a LoadBalancer. We will be coming back to this app later to upload a file.
 
 ```bash
 kubectl patch -n milvus svc/milvus-minio -p '{"spec": {"type": "LoadBalancer"}}'
+```
+
+Run the following commands to get the MinIO username and password.
+
+```bash
+kubectl get secret -n milvus milvus-minio -o jsonpath='{.data.root-user}' | base64 --decode && echo && k get secret -n milvus milvus-minio -o jsonpath='{.data.root-password}' | base64 --decode
 ```
 
 Get the external IP of the MinIO service and output the URL to the terminal.
@@ -277,7 +132,7 @@ echo http://$EXTERNAL_IP:9001
 
 Click the link in the terminal to open the MinIO dashboard. Use the username and password from the previous step to login.
 
-Under **Administrator**, click on the **Buckets** tab and create a new bucket named `ingestion`.
+Under **Administrator**, click on the **Buckets** tab and create two new buckets named `ingestion` and `mlflow`.
 
 Under **User**, click on the **Access Keys** tab and create a new access key and save both the access key and secret key to variables.
 
@@ -286,7 +141,79 @@ MINIO_ACCESS_KEY=<access_key>
 MINIO_SECRET_KEY=<secret_key>
 ```
 
-## Deploy vector-ingestion and chatbot apps
+## Deploy mlflow
+
+```bash
+cat << EOF > mlflow-app.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: mlflow
+spec:
+  destination:
+    name: ''
+    namespace: mlflow
+    server: 'https://kubernetes.default.svc'
+  source:
+    path: ''
+    repoURL: 'https://community-charts.github.io/helm-charts'
+    targetRevision: 0.7.19
+    chart: mlflow
+    helm:
+      valueFiles:
+        - values.yaml
+      parameters:
+        - name: artifactRoot.s3.bucket
+          value: mlflow
+        - name: backendStore.postgres.password
+          value: $PSQL_PASSWORD
+        - name: backendStore.postgres.enabled
+          value: 'true'
+        - name: backendStore.postgres.user
+          value: ${PSQL_USER}@${PSQL_FQDN}
+        - name: backendStore.postgres.host
+          value: $PSQL_FQDN
+        - name: backendStore.postgres.database
+          value: mlflow
+        - name: artifactRoot.s3.enabled
+          value: 'true'
+        - name: artifactRoot.s3.awsAccessKeyId
+          value: $MINIO_ACCESS_KEY
+        - name: artifactRoot.s3.awsSecretAccessKey
+          value: $MINIO_SECRET_KEY
+        - name: artifactRoot.s3.path
+          value: mlflow
+      values: |-
+        extraEnvVars:
+          MLFLOW_S3_ENDPOINT_URL: http://milvus-minio.milvus.svc:9001
+  sources: []
+  project: default
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+EOF
+```
+
+Then run the following command to deploy the mlflow app.
+
+```bash
+argocd app create mlflow --sync-policy auto -f mlflow-app.yaml
+```
+
+Wait a few minutes then run the following command to ensure the mlflow app is running.
+
+```bash
+argocd app get argocd/mlflow
+```
+
+If the mlflow app is not running, run the following command to get the logs.
+
+```bash
+MLFLOW_POD_NAME=$(kubectl get po -n mlflow -lapp=mlflow -ojsonpath='{.items[0].metadata.name}')
+kubectl logs -n mlflow $MLFLOW_POD_NAME
+```
+
+## Deploy vector-ingestion app
 
 Create the bigbertha-chatbot app manifest file.
 
@@ -328,7 +255,15 @@ Then run the following command to deploy the vector-ingestion app.
 argocd app create bigbertha-vector-ingestion --sync-policy auto -f vectoringestion-app.yaml
 ```
 
-Next head over to [HuggingFace](https://huggingface.co/settings/tokens), login to your account, then get your access token and save it to a variable.
+Wait a few minutes then run the following command to ensure the vector-ingestion app is running.
+
+```bash
+argocd app get argocd/bigbertha-vector-ingestion
+```
+
+## Deploy chatbot app
+
+Head over to [HuggingFace](https://huggingface.co/settings/tokens), login to your account, then get your access token and save it to a variable.
 
 ```bash
 HF_API_TOKEN=<your_access_token>
@@ -394,11 +329,29 @@ Then run the following command to deploy the chatbot app.
 argocd app create bigbertha-llmchatbot --sync-policy auto -f chatbot-app.yaml
 ```
 
+Wait a few minutes then run the following command to ensure the chatbot app is running.
+
+```bash
+argocd app get argocd/bigbertha-llmchatbot
+```
+
 Ensure all the components are deployed successfully and showing `Healthy` status.
 
 ```bash
 argocd app list
 ```
+
+## Verify the chatbot metrics endpoint is being scraped by Azure Managed Prometheus
+
+Run the following command to port-forward the AMA metrics pod to view the metrics.
+```bash
+AMA_METRICS_POD_NAME=$(kubectl get po -n kube-system -lrsName=ama-metrics -o jsonpath='{.items[0].metadata.name}')
+kubectl port-forward $AMA_METRICS_POD_NAME -n kube-system 9090
+```
+
+Open the Prometheus UI at http://localhost:9090 and click on the **Status** tab to view the targets. You should see the `serviceMonitor/bigbertha/bigbertha-llmchatbot-servicemonitor` target in **UP** state.
+
+The metrics endpoint should be scraped every minute and you should see the metrics for `thumbs_down_count` and `thumbs_up_count` when using the Prometheus Explorer within the Azure Monitor Workspace in the Azure Portal.
 
 ## Verify the model retraining workflow
 
@@ -422,19 +375,28 @@ Next, click the link to the metrics endpoint to view the metrics. You should see
 
 Refresh the chatbot page and click the thumbs down button a few times. This will trigger a Prometheus alert which will in turn trigger a retraining workflow.
 
-## Verify the chatbot metrics endpoint is being scraped by Azure Managed Prometheus
+Run the following command to confirm the event source triggered the retraining workflow.
 
-Run the following command to port-forward the AMA metrics pod to view the metrics.
 ```bash
-AMA_METRICS_POD_NAME=$(kubectl get po -n kube-system -lrsName=ama-metrics -o jsonpath='{.items[0].metadata.name}')
-kubectl port-forward $AMA_METRICS_POD_NAME -n kube-system 9090
+SENSOR_POD_NAME=$(kubectl get po -n bigbertha -l owner-name=retraining-sensor -ojsonpath='{.items[0].metadata.name}')
+kubectl logs -n bigbertha $SENSOR_POD_NAME
 ```
 
-Open the Prometheus UI at http://localhost:9090 and click on the **Status** tab to view the targets. You should see the `serviceMonitor/bigbertha/bigbertha-llmchatbot-servicemonitor` target in **UP** state.
+You should see the logs for the retraining workflow.
 
-The metrics endpoint should be scraped every 15 seconds and you should see the metrics for `thumbs_down_count` and `thumbs_up_count` when using the Prometheus Explorer within the Azure Monitor Workspace in the Azure Portal.
+```bash
+Name:                llm-retraining-pipeline-qt9fv
+Namespace:           bigbertha
+ServiceAccount:      unset
+Status:              Pending
+Created:             Mon Jul 01 05:03:54 +0000 (now)
+Progress:            
+{"level":"info","ts":1719810234.2049482,"logger":"argo-events.sensor","caller":"sensors/listener.go:423","msg":"Successfully processed trigger 'model-retraining-trigger'","sensorName":"retraining-sensor","triggerName":"model-retraining-trigger","triggerType":"ArgoWorkflow","triggeredBy":["retraining-webhook-triggered"],"triggeredByEvents":["66383862323364322d373566362d343734662d393565322d613034393865636432336633"]}
+``` 
 
-You should also see an alert in the Alerts blade in the AKS portal. This alert will trigger an Azure Event Hub alert which will trigger Argo Events and the Argo Workflow for model retraining.
+You should also see an alert in the Alerts blade in the Azure portal. This alert will trigger an Azure Event Hub alert which will trigger Argo Events and the Argo Workflow for model retraining.
+
+Run the following command to watch the retraining workflow.
 
 ```bash
 argo watch @latest -n bigbertha
@@ -467,5 +429,6 @@ You should see a **Loaded Collection** named `llamalection` with a **Approx Enti
 Run the following command to delete the resource group and all resources created.
 
 ```bash
-az group delete -n $RG_NAME --yes --no-wait
+cd azure/infra/terraform
+terraform destroy
 ```

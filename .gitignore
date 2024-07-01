@@ -163,3 +163,4 @@ cython_debug/
 **/llmops_rule.json
 chatbot-app.yaml
 vectoringestion-app.yaml
+mlflow-app.yaml
