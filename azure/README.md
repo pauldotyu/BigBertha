@@ -66,6 +66,9 @@ PSQL_PASSWORD=$(terraform output -raw psql_admin_password)
 
 # Get AKS credentials
 az aks get-credentials -n $AKS_NAME -g $RG_NAME
+
+# Restart kaito-gpu-provisioner
+kubectl rollout restart deployment/kaito-gpu-provisioner -n kube-system
 ```
 
 ## Deploy components

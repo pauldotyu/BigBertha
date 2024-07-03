@@ -50,3 +50,36 @@ resource "azurerm_kubernetes_cluster" "example" {
     ]
   }
 }
+
+resource "azapi_update_resource" "example" {
+  type        = "Microsoft.ContainerService/managedClusters@2024-03-02-preview"
+  resource_id = azurerm_kubernetes_cluster.example.id
+
+  body = {
+    properties = {
+      aiToolchainOperatorProfile = {
+        enabled = true
+      }
+    }
+  }
+}
+
+data "azurerm_user_assigned_identity" "example" {
+  resource_group_name = azurerm_kubernetes_cluster.example.node_resource_group
+  name                = "ai-toolchain-operator-${azurerm_kubernetes_cluster.example.name}"
+}
+
+resource "azurerm_role_assignment" "example" {
+  scope                = azurerm_kubernetes_cluster.example.id
+  principal_id         = data.azurerm_user_assigned_identity.example.principal_id
+  role_definition_name = "Contributor"
+}
+
+resource "azurerm_federated_identity_credential" "example" {
+  resource_group_name = azurerm_kubernetes_cluster.example.node_resource_group
+  parent_id           = data.azurerm_user_assigned_identity.example.id
+  issuer              = azurerm_kubernetes_cluster.example.oidc_issuer_url
+  name                = "kaito-federated-identity"
+  subject             = "system:serviceaccount:kube-system:kaito-gpu-provisioner"
+  audience            = ["api://AzureADTokenExchange"]
+}
